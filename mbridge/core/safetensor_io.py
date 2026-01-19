@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 import warnings
 from collections import defaultdict
 from glob import glob
@@ -167,6 +168,7 @@ class SafeTensorIO:
         new_hf_dir: str,
     ):
         assert self.index, "index file is required for memory efficient saving"
+        print(f'save weight: {hf_weight_name}')
         tmp_filename = f"{new_hf_dir}/{hf_weight_name}.safetensors"
         save_file({hf_weight_name: tensor}, tmp_filename)
 

@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import warnings
 from collections import defaultdict
 from glob import glob
@@ -108,19 +109,24 @@ class DequantFP8SafeTensorIO(SafeTensorIO):
             begin_idx = min(num_files, rank * num_files_rank)
             end_idx = min(num_files, (rank + 1) * num_files_rank)
             filename_list = filename_list[begin_idx:end_idx]
+            print(f"[R{rank}] files: {filename_list} (total: {num_files}, per_rank: {num_files_rank}, idx: {begin_idx}:{end_idx})")
 
         for filename in filename_list:
             keys_for_file = filename_to_keys_map[filename]
             states = {}
             old_keys_for_file, _ = self._mapping_weight_names_new2old(keys_for_file)
+            missing_count = 0
             for old_key, key in zip(old_keys_for_file, keys_for_file):
                 tmp_filename = f"{new_hf_dir}/{old_key}.safetensors"
                 if not os.path.exists(tmp_filename):
                     # if a weight is not loaded, it should not be saved, for w/ and w/o MTP
                     warnings.warn(f"Weight {key} not found, skipping saving it")
+                    missing_count += 1
                     continue
+
                 with safe_open(tmp_filename, framework="pt", device="cpu") as f:
                     states[key] = f.get_tensor(old_key)
                     os.remove(tmp_filename)
+            print(f"[R{rank}] {filename}: {len(states)}/{len(keys_for_file)} weights (missing: {missing_count})")
             save_file(states, os.path.join(new_hf_dir, filename))
         return
