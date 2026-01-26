@@ -126,7 +126,8 @@ class DequantFP8SafeTensorIO(SafeTensorIO):
 
                 with safe_open(tmp_filename, framework="pt", device="cpu") as f:
                     states[key] = f.get_tensor(old_key)
-                    os.remove(tmp_filename)
+                    #os.remove(tmp_filename)
+                    print(f"skip remove {tmp_filename}")
             print(f"[R{rank}] {filename}: {len(states)}/{len(keys_for_file)} weights (missing: {missing_count})")
             save_file(states, os.path.join(new_hf_dir, filename))
         return
