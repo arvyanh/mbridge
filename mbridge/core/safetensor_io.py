@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import warnings
+from tqdm import tqdm
 from collections import defaultdict
 from glob import glob
 from typing import Generator
@@ -17,6 +18,7 @@ class SafeTensorIO:
         index_file = os.path.join(hf_dir, "model.safetensors.index.json")
         config = AutoConfig.from_pretrained(hf_dir, trust_remote_code=True)
 
+        self.remove_file = []
         self.index = {}
         self.origin_index = {}
         if os.path.exists(index_file):
@@ -210,9 +212,21 @@ class SafeTensorIO:
                 tmp_filename = f"{new_hf_dir}/{old_key}.safetensors"
                 with safe_open(tmp_filename, framework="pt", device="cpu") as f:
                     states[key] = f.get_tensor(old_key)
-                    os.remove(tmp_filename)
+                    #os.remove(tmp_filename)
+                    print(f"skip remove: {tmp_filename}")
+                    self.remove_file.append(tmp_filename)
             save_file(states, os.path.join(new_hf_dir, filename))
+
+        # delete the tmp file after all the file has been merged without error
+        print("merge end, wait for deletion")
+        torch.distributed.barrier()
+        self.delete_tmp_file()
         return
+
+    def delete_tmp_file(self):
+        for filename in tqdm(self.remove_file, desc="remove tmp files"):
+            os.remove(filename)
+        self.remove_file = []
 
     def save_hf_weight_memory_efficient(
         self,

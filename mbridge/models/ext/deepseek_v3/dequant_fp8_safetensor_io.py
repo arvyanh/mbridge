@@ -128,6 +128,11 @@ class DequantFP8SafeTensorIO(SafeTensorIO):
                     states[key] = f.get_tensor(old_key)
                     #os.remove(tmp_filename)
                     print(f"skip remove {tmp_filename}")
-            print(f"[R{rank}] {filename}: {len(states)}/{len(keys_for_file)} weights (missing: {missing_count})")
+                    self.remove_file.append(tmp_filename)
             save_file(states, os.path.join(new_hf_dir, filename))
+
+        # delete the tmp file after all the file has been merged without error
+        print("merge end, wait for deletion")
+        torch.distributed.barrier()
+        self.delete_tmp_file()
         return
