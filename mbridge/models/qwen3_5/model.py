@@ -42,16 +42,24 @@ class _SPScatterEmbeddingWrapper:
     format is not known at ``__init__`` time, create with ``do_scatter=True``
     (the default) and replace the wrapper once on the first forward call via
     ``Qwen3_5GPTModel.init_mtp_embedding_scatter``.
+
+    When CP>1 (BSHD mode), after TP scatter the output is further CP-split along
+    the sequence dimension to match the CP-split hidden_states in the decoder.
     """
 
-    def __init__(self, real_embedding, do_scatter: bool):
+    def __init__(self, real_embedding, do_scatter: bool, cp_size: int = 1):
         self._real_embedding = real_embedding
         self._do_scatter = do_scatter
+        self._cp_size = cp_size
 
     def __call__(self, **kwargs):
         out = self._real_embedding(**kwargs)
         if self._do_scatter:
             out = tensor_parallel.scatter_to_sequence_parallel_region(out)
+            if self._cp_size > 1:
+                # BSHD + CP: further split along seq dim to match CP-split hidden_states.
+                # out is [S/TP, B, H] after TP scatter; split_data_cp_rank expects seq_dim=0.
+                out = split_data_cp_rank(out, self._cp_size, seq_dim=0)
             out = out.contiguous()
         return out
 
@@ -104,7 +112,7 @@ class Qwen3_5GPTModel(GPTModel):
                 ),
             )
 
-    def init_mtp_embedding_scatter(self, do_scatter: bool) -> None:
+    def init_mtp_embedding_scatter(self, do_scatter: bool, cp_size: int = 1) -> None:
         """Replace the MTP embedding wrapper with the correct scatter setting.
 
         Called once by ``Qwen3_5VLModel.forward`` on the first forward pass, after
@@ -115,12 +123,12 @@ class Qwen3_5GPTModel(GPTModel):
         wrapper = object.__getattribute__(self, "embedding")  # bypasses __getattr__
         if not isinstance(wrapper, _SPScatterEmbeddingWrapper):
             return
-        if wrapper._do_scatter == do_scatter:
+        if wrapper._do_scatter == do_scatter and wrapper._cp_size == cp_size:
             return  # already correct, nothing to do
         object.__setattr__(
             self,
             "embedding",
-            _SPScatterEmbeddingWrapper(wrapper._real_embedding, do_scatter=do_scatter),
+            _SPScatterEmbeddingWrapper(wrapper._real_embedding, do_scatter=do_scatter, cp_size=cp_size),
         )
 
 
@@ -502,25 +510,15 @@ class Qwen3_5VLModel(MegatronModule):
                 # THD mode: embedding wrapper must scatter (do_scatter=True).
                 self.language_model.init_mtp_embedding_scatter(do_scatter=True)
             else:
+                # BSHD mode: pass full input_ids [B, S] to language_model; the embedding wrapper
+                # scatters the embedding output to SP-local via do_scatter=sequence_parallel.
+                # Do NOT scatter input_ids here — MTP needs the full sequence to roll correctly
+                # across SP boundaries (VocabParallelEmbedding all-reduce requires same tokens on
+                # all TP ranks, which is only true with the full sequence).
                 sp_input_ids = input_ids
-
-                if input_ids is not None and combined_embeddings is not None:
-                    # BSHD mode: input_ids may arrive already SP-scattered (shape [B, S/TP])
-                    # or still full-length (shape [B, S]).  combined_embeddings has already been
-                    # CP-split and TP-scattered by this point, so its dim-0 equals S/(TP*CP*2).
-                    # We need sp_input_ids to be [B, S/(TP*CP*2)] so that MTP embedding output
-                    # [S/(TP*CP*2), B, H] matches hidden_states [S/(TP*CP*2), B, H].
-                    # Step 1: TP scatter along seq dim: [B, S] -> [B, S/TP]
-                    # Step 2: CP split along seq dim:   [B, S/TP] -> [B, S/(TP*CP*2)]
-                    if input_ids.shape[1] != combined_embeddings.shape[0]:
-                        sp_input_ids = input_ids.permute(1, 0).contiguous()
-                        sp_input_ids = tensor_parallel.scatter_to_sequence_parallel_region(sp_input_ids)
-                        if cp_size > 1:
-                            # CP split: [S/TP, B] -> [S/(TP*CP*2), B]
-                            sp_input_ids = split_data_cp_rank(sp_input_ids, cp_size, seq_dim=0)
-                        sp_input_ids = sp_input_ids.permute(1, 0).contiguous()
-                    # sp_input_ids is now [B, S/(TP*CP*2)]: embedding wrapper must NOT scatter again.
-                    self.language_model.init_mtp_embedding_scatter(do_scatter=False)
+                self.language_model.init_mtp_embedding_scatter(
+                    do_scatter=self.config.sequence_parallel, cp_size=cp_size
+                )
 
         return self.language_model(
             input_ids=sp_input_ids,
