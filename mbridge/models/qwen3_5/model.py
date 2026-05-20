@@ -57,8 +57,6 @@ class _SPScatterEmbeddingWrapper:
         if self._do_scatter:
             out = tensor_parallel.scatter_to_sequence_parallel_region(out)
             if self._cp_size > 1:
-                # BSHD + CP: further split along seq dim to match CP-split hidden_states.
-                # out is [S/TP, B, H] after TP scatter; split_data_cp_rank expects seq_dim=0.
                 out = split_data_cp_rank(out, self._cp_size, seq_dim=0)
             out = out.contiguous()
         return out
@@ -409,8 +407,12 @@ class Qwen3_5VLModel(MegatronModule):
                 and cp_size > 1
                 and packed_seq_params is None
             ):
-                combined_embeddings = split_data_cp_rank(
-                    combined_embeddings, cp_size, 0
+                # FIX: input_ids is already CP-local (from megatron's preprocess_bshd_engine).
+                # The embedding produces [S/CP, B, H] via all-reduce. We only need TP scatter
+                # to get [S/(TP*CP), B, H]. Using split_data_cp_rank would double-zigzag
+                # the already-CP-split tokens and misalign position_ids.
+                combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+                    combined_embeddings
                 )
             if packed_seq_params is not None:
                 input_ids_thd, _ = preprocess_packed_seqs(
@@ -457,17 +459,42 @@ class Qwen3_5VLModel(MegatronModule):
         attention_mask_orig = attention_mask
 
         if position_ids is None:
-            # BSHD
-            position_ids, _ = get_rope_index(
-                self.config.spatial_merge_size,
-                self.image_token_id,
-                self.video_token_id,
-                self.vision_start_token_id,
-                input_ids,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                attention_mask=attention_mask,
-            )  #  [3*b*s]
+            if cp_size > 1 and self.pre_process:
+                # position_ids=None occurs when caller detects vision_config on hf_config
+                # (even for text-only usage). With CP>1, input_ids is already CP-local [B, S/CP].
+                # Sequential positions from get_rope_index would be wrong (gives [0:S/CP-1]
+                # instead of the original zigzag positions in the full sequence).
+                # Reconstruct correct zigzag positions for this CP rank.
+                cp_rank = mpu.get_context_parallel_rank()
+                local_seq_len = input_ids.shape[1]           # S/CP
+                full_seq_len = local_seq_len * cp_size        # S
+                chunk_len = full_seq_len // (2 * cp_size)     # S/(2*CP)
+                first_pos = torch.arange(
+                    cp_rank * chunk_len, (cp_rank + 1) * chunk_len,
+                    dtype=torch.long, device=input_ids.device
+                )
+                second_pos = torch.arange(
+                    full_seq_len - (cp_rank + 1) * chunk_len,
+                    full_seq_len - cp_rank * chunk_len,
+                    dtype=torch.long, device=input_ids.device
+                )
+                cp_pos = torch.cat([first_pos, second_pos])  # [S/CP]
+                # Expand to mrope format [3, B, S/CP]
+                position_ids = cp_pos.unsqueeze(0).unsqueeze(0).expand(
+                    3, input_ids.shape[0], local_seq_len
+                ).contiguous()
+            else:
+                # BSHD
+                position_ids, _ = get_rope_index(
+                    self.config.spatial_merge_size,
+                    self.image_token_id,
+                    self.video_token_id,
+                    self.vision_start_token_id,
+                    input_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask,
+                )  #  [3*b*s]
             if packed_seq_params is not None:
                 # convert position_ids to THD format
                 position_ids = (
@@ -519,6 +546,26 @@ class Qwen3_5VLModel(MegatronModule):
                 self.language_model.init_mtp_embedding_scatter(
                     do_scatter=self.config.sequence_parallel, cp_size=cp_size
                 )
+
+        # FIX: Ensure each TP rank has CORRECT position_ids for its tokens.
+        # Megatron does NOT automatically SP-scatter position_ids, so both TP ranks
+        # would use the same positions (wrong for TP rank 1).
+        # Solution:
+        #   1. Scatter position_ids by TP → each rank gets [3,B,S/(TP*CP)] with correct positions
+        #   2. Repeat to [3,B,2*S/(TP*CP)] = [3,B,S/CP] → GPTModel generates freqs for
+        #      S/CP//cp_size = S/(TP*CP) positions, matching hidden_states — no shape error
+        #   3. freqs[0:S/(TP*CP)] = correct per-TP-rank positions ✓
+        if (
+            position_ids is not None
+            and cp_size > 1
+            and self.config.sequence_parallel
+        ):
+            # Step 1: scatter position_ids by TP → [3, B, S/(TP*CP)]
+            pos_t = position_ids.permute(2, 1, 0).contiguous()  # [S/CP, B, 3]
+            pos_local = tensor_parallel.scatter_to_sequence_parallel_region(pos_t)  # [S/(TP*CP), B, 3]
+            pos_local = pos_local.permute(2, 1, 0).contiguous()  # [3, B, S/(TP*CP)]
+            # Step 2: repeat to restore S/CP length → GPTModel sees correct size
+            position_ids = torch.cat([pos_local, pos_local], dim=2)  # [3, B, 2*S/(TP*CP)] = [3, B, S/CP]
 
         return self.language_model(
             input_ids=sp_input_ids,
