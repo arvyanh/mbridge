@@ -433,14 +433,10 @@ class Qwen3_5VLModel(MegatronModule):
                 combined_embeddings[vision_mask] = vision_embeds
                 combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
 
-            if (
-                combined_embeddings is not None
-                and cp_size > 1
-                and packed_seq_params is None
-            ):
-                combined_embeddings = split_data_cp_rank(
-                    combined_embeddings, cp_size, 0
-                )
+            # NOTE: For BSHD (packed_seq_params is None), input_ids is already CP-local
+            # [B, S/CP] from preprocess_bshd_engine. The embedding gives [S/CP, B, H].
+            # No split_data_cp_rank needed — step4 TP scatter handles [S/CP]→[S/(TP*CP)].
+            # split_data_cp_rank is only correct when input_ids is the full sequence (THD).
 
             # packed_seq_params is not None and attention_mask is None: 
             # means we already packed input_ids
@@ -524,11 +520,15 @@ class Qwen3_5VLModel(MegatronModule):
                     attention_mask=attention_mask,
                 )  # [3, B, S] with VLM positions
             else:
-                # Text-only: sequential mrope positions [3, B, S]
-                seq_len = input_ids.shape[1]
-                pos = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
+                # Text-only: sequential mrope positions.
+                # For CP>1, pass full-sequence [3, B, S] so that
+                # get_pos_emb_on_this_cp_rank correctly zigzag-splits to [S/CP].
+                # For CP=1, S/CP == S so full_seq_len == seq_len.
+                seq_len = input_ids.shape[1]  # S/CP in BSHD
+                full_seq_len = seq_len * cp_size
+                pos = torch.arange(full_seq_len, dtype=torch.long, device=input_ids.device)
                 position_ids = pos.unsqueeze(0).unsqueeze(0).expand(
-                    3, input_ids.shape[0], seq_len
+                    3, input_ids.shape[0], full_seq_len
                 ).contiguous()
             if packed_seq_params is not None:
                 # convert position_ids to THD format
@@ -572,16 +572,10 @@ class Qwen3_5VLModel(MegatronModule):
                 # THD mode: embedding wrapper must scatter (do_scatter=True).
                 self.language_model.init_mtp_embedding_scatter(do_scatter=True)
             else:
-                # BSHD mode: only CP-split input_ids, let the embedding wrapper
-                # handle TP scatter after embedding.  This is critical because
-                # MTP's roll_tensor only exchanges boundary tokens across CP ranks
-                # (via isend/irecv), NOT across TP ranks.  Pre-scattering by TP
-                # would cause incorrect "next token" lookups at TP boundaries.
+                # BSHD mode: input_ids is already CP-local [B, S/CP] from
+                # preprocess_bshd_engine. The embedding wrapper does TP scatter only.
+                # Do NOT split_data_cp_rank — input_ids is already CP-local.
                 sp_input_ids = input_ids
-                if input_ids is not None and cp_size > 1:
-                    sp_input_ids = split_data_cp_rank(
-                        input_ids, cp_size, seq_dim=1
-                    )
                 self.language_model.init_mtp_embedding_scatter(do_scatter=True)
 
         return self.language_model(
