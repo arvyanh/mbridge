@@ -511,17 +511,25 @@ class Qwen3_5VLModel(MegatronModule):
         attention_mask_orig = attention_mask
 
         if position_ids is None:
-            # BSHD
-            position_ids, _ = get_rope_index(
-                self.config.spatial_merge_size,
-                self.image_token_id,
-                self.video_token_id,
-                self.vision_start_token_id,
-                input_ids,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                attention_mask=attention_mask,
-            )  #  [3*b*s]
+            has_vision = image_grid_thw is not None or video_grid_thw is not None
+            if has_vision:
+                position_ids, _ = get_rope_index(
+                    self.config.spatial_merge_size,
+                    self.image_token_id,
+                    self.video_token_id,
+                    self.vision_start_token_id,
+                    input_ids,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask,
+                )  # [3, B, S] with VLM positions
+            else:
+                # Text-only: sequential mrope positions [3, B, S]
+                seq_len = input_ids.shape[1]
+                pos = torch.arange(seq_len, dtype=torch.long, device=input_ids.device)
+                position_ids = pos.unsqueeze(0).unsqueeze(0).expand(
+                    3, input_ids.shape[0], seq_len
+                ).contiguous()
             if packed_seq_params is not None:
                 # convert position_ids to THD format
                 position_ids = (
